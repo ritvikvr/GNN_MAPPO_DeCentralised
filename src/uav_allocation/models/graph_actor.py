@@ -115,6 +115,18 @@ class GraphActor(nn.Module):
         self.memory = TemporalMemory(H) if mcfg.recurrent else None
         self.score = nn.Sequential(nn.Linear(2 * H + dims.e_ut, H), nn.ReLU(), nn.Linear(H, H // 2), nn.ReLU(), nn.Linear(H // 2, 1))
         self.special = nn.Sequential(nn.Linear(2 * H, H), nn.ReLU(), nn.Linear(H, N_SPECIAL))
+        # Head 2: Protocol intent head (AUTO=0, DEFEND=1, YIELD=2, RENEW=3)
+        self.protocol_head = nn.Sequential(nn.Linear(H, H // 2), nn.ReLU(), nn.Linear(H // 2, 4))
+        # Head 3: Learned confirmation-window duration (10 discrete durations: 1 to 10 steps)
+        self.window_head = nn.Sequential(nn.Linear(H, H // 2), nn.ReLU(), nn.Linear(H // 2, 10))
+        # Head 4: Communication send-gate (TRANSMIT=0, SUPPRESS=1)
+        self.comm_gate_head = nn.Sequential(nn.Linear(H, H // 2), nn.ReLU(), nn.Linear(H // 2, 2))
+        # Head 5: Auxiliary Intent Prediction Head (predicts target displacement (dx, dy) and action class for neighbors)
+        self.intent_pred_head = nn.Sequential(
+            nn.Linear(2 * H + dims.e_uu, H), nn.ReLU(),
+            nn.Linear(H, H // 2), nn.ReLU(),
+            nn.Linear(H // 2, 2)
+        )
         self.value_head = mlp(H, H, 1)     # used only by the IPPO ablation (decentralised value); never by act()
 
     # ---------------------------------------------------------------- 1. encode
@@ -130,7 +142,7 @@ class GraphActor(nn.Module):
             h_ego = self.memory(h_ego, hidden)
             new_hidden = h_ego
         hb_pool = (hb * b["base_mask"].unsqueeze(-1)).sum(1) / b["base_mask"].sum(1, keepdim=True).clamp(min=1)
-        return {"h_ego": h_ego, "h_task": ht, "h_base": hb_pool, "hidden": new_hidden}
+        return {"h_ego": h_ego, "h_uav": hu, "h_task": ht, "h_base": hb_pool, "hidden": new_hidden}
 
     # ---------------------------------------------------------------- 2. score
     def score_candidates(self, enc: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -152,13 +164,85 @@ class GraphActor(nn.Module):
             mask[empty, self.dims.n_task] = True
         return MaskedCategorical(logits, mask), enc
 
+    def evaluate_actions(self, b: Dict[str, torch.Tensor], actions: torch.Tensor,
+                         protos: torch.Tensor, wins: torch.Tensor, comms: torch.Tensor,
+                         hidden: Optional[torch.Tensor] = None
+                         ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Evaluates joint log probability and individual/composite entropies and individual log-probabilities across all 4 heads."""
+        dist, enc = self.get_action_distribution(b, hidden)
+        logp_alloc = dist.log_prob(actions)
+        ent_alloc = dist.entropy()
+
+        proto_dist = Categorical(logits=self.protocol_head(enc["h_ego"]))
+        logp_proto = proto_dist.log_prob(protos)
+        ent_proto = proto_dist.entropy()
+
+        win_dist = Categorical(logits=self.window_head(enc["h_ego"]))
+        # wins is stored as duration 1..10, so class index is wins - 1
+        win_idx = torch.clamp(wins - 1, 0, 9)
+        logp_win = win_dist.log_prob(win_idx)
+        ent_win = win_dist.entropy()
+
+        comm_dist = Categorical(logits=self.comm_gate_head(enc["h_ego"]))
+        logp_comm = comm_dist.log_prob(comms)
+        ent_comm = comm_dist.entropy()
+
+        joint_logp = logp_alloc + logp_proto + logp_win + logp_comm
+        joint_ent = (ent_alloc + ent_proto + ent_win + ent_comm).mean()
+        entropies = {
+            "alloc": ent_alloc.mean().detach(),
+            "proto": ent_proto.mean().detach(),
+            "win": ent_win.mean().detach(),
+            "comm": ent_comm.mean().detach(),
+        }
+        logps = {
+            "alloc": logp_alloc.detach(),
+            "proto": logp_proto.detach(),
+            "win": logp_win.detach(),
+            "comm": logp_comm.detach(),
+        }
+        return joint_logp, joint_ent, enc, entropies, logps
+
     # ---------------------------------------------------------------- 4. act
     @torch.no_grad()
     def act(self, b: Dict[str, torch.Tensor], hidden: Optional[torch.Tensor] = None, deterministic: bool = False
             ) -> Dict[str, torch.Tensor]:
         dist, enc = self.get_action_distribution(b, hidden)
         a = dist.probs.argmax(-1) if deterministic else dist.sample()
-        return {"action": a, "log_prob": dist.log_prob(a), "entropy": dist.entropy(), "hidden": enc["hidden"]}
+
+        proto_logits = self.protocol_head(enc["h_ego"])
+        proto_dist = Categorical(logits=proto_logits)
+        proto_a = proto_logits.argmax(-1) if deterministic else proto_dist.sample()
+
+        # Stochastic Categorical confirmation-window duration (1 to 10 steps)
+        win_logits = self.window_head(enc["h_ego"])
+        win_dist = Categorical(logits=win_logits)
+        win_idx = win_logits.argmax(-1) if deterministic else win_dist.sample()
+        win_steps = win_idx + 1  # Map index [0..9] to duration [1..10]
+
+        # Communication send-gate
+        comm_logits = self.comm_gate_head(enc["h_ego"])
+        comm_dist = Categorical(logits=comm_logits)
+        comm_a = comm_logits.argmax(-1) if deterministic else comm_dist.sample()
+
+        # Joint log-probability and joint entropy over all 4 stochastic decision heads
+        logp = dist.log_prob(a) + proto_dist.log_prob(proto_a) + win_dist.log_prob(win_idx) + comm_dist.log_prob(comm_a)
+        entropy = dist.entropy() + proto_dist.entropy() + win_dist.entropy() + comm_dist.entropy()
+
+        # Neighbor intent prediction (dx, dy)
+        pred_intent = self.predict_neighbor_intent(enc, b)
+        return {
+            "action": a, "protocol": proto_a, "window": win_steps, "comm": comm_a,
+            "intent": pred_intent, "log_prob": logp, "entropy": entropy, "hidden": enc["hidden"]
+        }
+
+    def predict_neighbor_intent(self, enc: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Predicts neighbor target displacement (dx, dy) in [-1, 1] relative to ego."""
+        B, Nu, H = enc["h_uav"].shape
+        ego = enc["h_ego"].unsqueeze(1).expand(-1, Nu, -1)
+        pair_feat = torch.cat([ego, enc["h_uav"], b["e_uu"][:, 0]], dim=-1)
+        pred_intent = torch.tanh(self.intent_pred_head(pair_feat))  # [B, Nu, 2]
+        return pred_intent
 
     def local_value(self, enc: Dict[str, torch.Tensor]) -> torch.Tensor:
         return self.value_head(enc["h_ego"]).squeeze(-1)

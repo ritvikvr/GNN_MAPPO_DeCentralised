@@ -29,7 +29,7 @@ from ..safety.feasibility import FeasibilityChecker, TaskArrays
 from .communication import CommNetwork
 from .dynamics import WindModel, move_towards, nominal_travel_energy, service_energy
 from .task import Task, TaskInfo, TaskStatus
-from .uav import Action, ActionKind, UAV, UAVStatus
+from .uav import Action, ActionKind, ProtocolIntent, UAV, UAVStatus
 
 MAX_GLOBAL_UAV = 64
 MAX_GLOBAL_TASK = 128
@@ -224,6 +224,13 @@ class UAVTaskEnv:
         if u.status == UAVStatus.FAILED:
             return
         tab = self.coord.tables[uid]
+        if hasattr(a, "comm"):
+            effective_comm = 0 if self.cfg.coordination.no_comm_gate else a.comm
+            self.coord.set_comm_gate(uid, effective_comm)
+        if hasattr(a, "protocol"):
+            effective_proto = 0 if self.cfg.coordination.no_protocol else a.protocol
+            self.coord.set_protocol_intent(uid, effective_proto)
+
         if a.kind == ActionKind.CONTINUE:
             return
         if a.kind == ActionKind.WAIT:
@@ -238,6 +245,15 @@ class UAVTaskEnv:
             self._do_return_or_emergency(u, t)
             return
         # ---- TASK
+        # Check protocol intent overrides
+        if hasattr(a, "protocol") and not self.cfg.coordination.no_protocol:
+            if a.protocol == ProtocolIntent.YIELD and u.has_commitment:
+                self._release_commitment(u, t, comp, switch=True)
+                u.status = UAVStatus.IDLE
+                return
+            elif a.protocol == ProtocolIntent.RENEW and tab.own is not None:
+                self.coord.renew_lease(uid, t)
+
         info = tab.tasks.get(a.task_id)
         if info is None or a.task_id in tab.done or u.status in (UAVStatus.EXECUTING, UAVStatus.RETURNING, UAVStatus.CHARGING):
             self.m["invalid_actions"] += 1
@@ -258,8 +274,13 @@ class UAVTaskEnv:
         task = self.tasks[a.task_id]
         slack = info.deadline - (t + float(feas.eta[0]) + info.service_duration)
         bid = compute_bid(info.priority, float(feas.eta[0]), info.service_duration, slack, float(feas.e_travel[0]), u.capacity)
-        self.coord.request(uid, info, bid, t)
+        win = getattr(a, "confirm_window", 0)
+        self.coord.request(uid, info, bid, t, confirm_window=win)
         u.task_id = a.task_id
+        if getattr(a, "bundle", None):
+            u.task_queue = list(a.bundle)
+        else:
+            u.task_queue = []
         u.progress = 0.0
         u.status = UAVStatus.RESERVED if self.cfg.coordination.enabled else UAVStatus.EN_ROUTE
         self.m["requests"] += 1
@@ -433,7 +454,50 @@ class UAVTaskEnv:
         u.tasks_done += 1
         u.payload_rem = max(0.0, u.payload_rem - task.payload)
         self._release_commitment(u, t, comp, switch=False, completed=True)
-        u.status = UAVStatus.IDLE
+
+        # Multi-task bundle chaining: conditional feasibility, reservation status, and battery margin check
+        chained = False
+        tab = self.coord.tables[u.id] if self.mode != "centralized" else None
+        while u.task_queue:
+            next_tid = u.task_queue.pop(0)
+            if next_tid >= len(self.tasks):
+                continue
+            next_task = self.tasks[next_tid]
+            # 1. Terminal / unannounced check
+            if next_task.status.terminal or not next_task.announced:
+                continue
+            # 2. Reservation table check: is it already claimed/reserved by another agent?
+            if tab is not None:
+                rem_res = tab.remote.get(next_tid)
+                if rem_res is not None and rem_res.is_active(t):
+                    continue
+            info = tab.tasks.get(next_tid) if tab else TaskInfo.from_task(next_task)
+            if info is None:
+                continue
+            # 3. Dynamic physical feasibility check (battery, speed, deadline from current UAV position)
+            feas = self.checker.check(u, self._tasks_arrays([info]), t)
+            if not feas.mask[0]:
+                continue
+            # 4. Strict battery safety reserve after completing the candidate task and returning to base
+            d_base = float(np.linalg.norm(self.bases - next_task.pos[None, :], axis=1).min())
+            e_return = nominal_travel_energy(d_base, self.cfg.env) * (1.0 + self.cfg.safety.energy_margin)
+            e_needed = float(feas.e_travel[0]) + service_energy(info.service_duration, self.cfg.env) + e_return
+            if u.energy - e_needed < u.capacity * self.cfg.safety.reserve_frac:
+                continue
+
+            slack = info.deadline - (t + float(feas.eta[0]) + info.service_duration)
+            bid = compute_bid(info.priority, float(feas.eta[0]), info.service_duration, slack, float(feas.e_travel[0]), u.capacity)
+            if self.mode != "centralized":
+                self.coord.request(u.id, info, bid, t)
+            u.task_id = next_tid
+            u.progress = 0.0
+            u.status = UAVStatus.RESERVED if (self.mode != "centralized" and self.cfg.coordination.enabled) else UAVStatus.EN_ROUTE
+            self.m["requests"] += 1
+            chained = True
+            break
+
+        if not chained:
+            u.status = UAVStatus.IDLE
 
     def _expire_tasks(self, comp) -> None:
         for task in self.tasks:
@@ -466,6 +530,8 @@ class UAVTaskEnv:
             events += self.coord.tick(t, self.comm.outage_until, alive)
             for uid, name, tid in events:
                 self._handle_event(uid, name, tid, t, comp)
+            if self.cfg.coordination.recovery_takeover:
+                self._check_recovery_takeovers(t, comp, events)
         self._refresh_truth()
         for u in self.uavs:
             if u.status in (UAVStatus.IDLE, UAVStatus.RESERVED) and self.checker.must_return(u):
@@ -497,6 +563,47 @@ class UAVTaskEnv:
                 u.task_id, u.progress, u.status = -1, 0.0, UAVStatus.IDLE
                 self.m["yields"] += 1
                 self.last_conflict_t = t
+
+    def _check_recovery_takeovers(self, t: int, comp, events: List[Tuple[int, str, int]]) -> None:
+        """Fix 3: When a task reservation is expired/released due to failure, allow available operational UAVs to bid and take over."""
+        reopened = [tid for _, name, tid in events if name == "lease_expired"]
+        if not reopened:
+            return
+        for tid in set(reopened):
+            if tid >= len(self.tasks):
+                continue
+            task = self.tasks[tid]
+            if task.status.terminal or not task.announced:
+                continue
+            # Find operational idle UAVs capable of reaching and servicing the task
+            best_u, best_bid, best_info = None, -1.0, None
+            for u in self.uavs:
+                if u.status != UAVStatus.IDLE:
+                    continue
+                tab = self.coord.tables[u.id]
+                info = tab.tasks.get(tid)
+                if info is None or tid in tab.done:
+                    continue
+                feas = self.checker.check(u, self._tasks_arrays([info]), t)
+                if not feas.mask[0]:
+                    continue
+                d_base = float(np.linalg.norm(self.bases - task.pos[None, :], axis=1).min())
+                e_return = nominal_travel_energy(d_base, self.cfg.env) * (1.0 + self.cfg.safety.energy_margin)
+                e_needed = float(feas.e_travel[0]) + service_energy(info.service_duration, self.cfg.env) + e_return
+                if u.energy - e_needed < u.capacity * self.cfg.safety.reserve_frac:
+                    continue
+                slack = info.deadline - (t + float(feas.eta[0]) + info.service_duration)
+                bid = compute_bid(info.priority, float(feas.eta[0]), info.service_duration, slack, float(feas.e_travel[0]), u.capacity)
+                if bid > best_bid:
+                    best_u, best_bid, best_info = u, bid, info
+
+            if best_u is not None and best_info is not None:
+                self.coord.request(best_u.id, best_info, best_bid, t)
+                best_u.task_id = tid
+                best_u.progress = 0.0
+                best_u.status = UAVStatus.RESERVED
+                self.m["requests"] += 1
+                self.m["reassignments"] += 1
 
     def _refresh_truth(self) -> None:
         by_task: Dict[int, List[UAV]] = defaultdict(list)
@@ -574,6 +681,9 @@ class UAVTaskEnv:
             "energy_depleted": m["energy_depleted"],
             "emergency_landings": m["emergency_landings"],
             "safety_overrides": m["safety_overrides"],
+            "suppressed_heartbeats": float(self.coord.metrics.get("suppressed_heartbeats", 0)),
+            "sent_heartbeats": float(self.coord.metrics.get("sent_heartbeats", 0)),
+            "discovery_latency_mean": float(np.mean(self.coord.metrics["discovery_latencies"])) if self.coord.metrics.get("discovery_latencies") else 0.0,
             "partition_recovery_steps": part_rec,
             "episode_return": self.ep_return,
             "steps": float(self.t),

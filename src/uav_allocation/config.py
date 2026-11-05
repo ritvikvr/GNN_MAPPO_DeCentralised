@@ -79,6 +79,15 @@ class CoordConfig:
     confirm_window: int = 3
     lease_duration: int = 12
     renew_period: int = 4
+    # Ablation and experimentation flags
+    no_confirm_fix: bool = False
+    no_protocol: bool = False
+    no_adaptive_window: bool = False
+    no_comm_gate: bool = False
+    heartbeat_urgency_confirmed: bool = False
+    failure_aware_release: bool = False
+    recovery_takeover: bool = False
+    bundle_size: int = 1
 
 
 @dataclass
@@ -102,6 +111,7 @@ class ModelConfig:
     heads: int = 4
     max_uav_nodes: int = 6
     max_task_nodes: int = 12
+    no_spatial_guidance: bool = False
 
 
 @dataclass

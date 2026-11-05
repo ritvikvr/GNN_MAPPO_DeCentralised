@@ -153,9 +153,13 @@ class GraphBuilder:
                 adj_ub[vi, b] = True
         # ------------------------------------------------ action mask (hard safety layer applied BEFORE the policy)
         status_ok = u.status in (UAVStatus.IDLE, UAVStatus.RESERVED, UAVStatus.EN_ROUTE)
+        cooldowns = tab.yield_cooldown if tab is not None else {}
         for s in range(nT):
             tid = known[order[s]].id
             if not status_ok or tid == own_tid or not feas.mask[order[s]]:
+                continue
+            # Break preemption thrashing loop: do not select tasks currently in yield quarantine
+            if t < cooldowns.get(tid, 0):
                 continue
             c = claimed_by_other(tid)
             if coord_on and c is not None and int(c.status) >= 1:

@@ -31,10 +31,26 @@ class ActionKind(IntEnum):
     CONTINUE = 3
 
 
+class ProtocolIntent(IntEnum):
+    AUTO = 0
+    DEFEND = 1
+    YIELD = 2
+    RENEW = 3
+
+
+class CommAction(IntEnum):
+    TRANSMIT = 0  # broadcast heartbeat and updates normally
+    SUPPRESS = 1  # suppress non-critical transmission to conserve radio bandwidth
+
+
 @dataclass(frozen=True)
 class Action:
     kind: ActionKind
     task_id: int = -1
+    protocol: ProtocolIntent = ProtocolIntent.AUTO
+    confirm_window: int = 0  # learned confirmation duration (0 = default)
+    comm: CommAction = CommAction.TRANSMIT  # communication send-gate decision
+    bundle: Tuple[int, ...] = field(default_factory=tuple)  # queued multi-task bundle sequence
 
 
 WAIT = Action(ActionKind.WAIT)
@@ -55,6 +71,7 @@ class UAV:
     vel: np.ndarray = field(default_factory=lambda: np.zeros(2))
     status: UAVStatus = UAVStatus.IDLE
     task_id: int = -1                   # current task / reservation target (truth)
+    task_queue: List[int] = field(default_factory=list)  # queued multi-task bundle targets
     base_id: int = -1                   # base currently targeted / charging at
     progress: float = 0.0               # mission progress of the current task in [0, 1]
     comm_outage_until: int = 0

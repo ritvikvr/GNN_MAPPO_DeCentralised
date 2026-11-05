@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import itertools
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -26,14 +27,42 @@ class CoordinationLayer:
         self.tables = [LocalReservationTable(i, cc.lease_duration, cc.confirm_window, cc.renew_period)
                        for i in range(n_uavs)]
         self.adj = np.zeros((n_uavs, n_uavs), dtype=bool)
+        self.protocol_intents = [0] * n_uavs  # ProtocolIntent per UAV
+        self.comm_gates = [0] * n_uavs        # CommAction per UAV (0=TRANSMIT, 1=SUPPRESS)
         self.metrics: Dict[str, Any] = defaultdict(float)
         self.metrics["reservation_latencies"] = []
         self.metrics["conflict_log"] = []          # (step, task_id, loser, winner)
+        self.metrics["suppressed_heartbeats"] = 0
+        self.metrics["sent_heartbeats"] = 0
+        self.metrics["discovery_latencies"] = []    # t_detected - t_created
         self._ids = itertools.count(1_000_000)    # claim msg ids (distinct from network ids)
 
     # ------------------------------------------------------------------ topology
     def begin_step(self, t: int, pos: np.ndarray, alive: np.ndarray) -> None:
         self.adj = self.comm.adjacency(pos, t, alive)
+        # Failure-aware evidence propagation: if enabled, pass confirmed dead UAVs to local tables
+        if self.cc.failure_aware_release:
+            dead_uavs = {i for i, is_alive in enumerate(alive) if not is_alive}
+            for tab in self.tables:
+                tab.confirmed_failed_uavs = dead_uavs
+
+    def set_protocol_intent(self, uid: int, intent: int) -> None:
+        self.protocol_intents[uid] = int(intent)
+
+    def set_comm_gate(self, uid: int, comm_action: int) -> None:
+        self.comm_gates[uid] = int(comm_action)
+
+    def renew_lease(self, uid: int, t: int) -> None:
+        tab = self.tables[uid]
+        if tab.own is not None:
+            r = tab.set_executing(t, next(self._ids)) if tab.own.status == ResStatus.EXECUTING else replace(
+                tab.own, timestamp=t, expiry=t + tab.lease, msg_id=next(self._ids)
+            )
+            tab.own = r
+            tab.claims[r.task_id] = r
+            tab._last_renew = t
+            self._send_claim(uid, r, tab.tasks.get(r.task_id), t)
+            self.metrics["renews"] += 1
 
     def _nbrs(self, uid: int) -> np.ndarray:
         return np.nonzero(self.adj[uid])[0]
@@ -44,19 +73,21 @@ class CoordinationLayer:
             self.comm.ground_send(Message(MsgKind.ANNOUNCE, -1, {"task": info}, 48, t), i, t, self.mc.command_loss)
 
     # ------------------------------------------------------------------ own claims
-    def request(self, uid: int, info: TaskInfo, bid: float, t: int) -> Reservation:
+    def request(self, uid: int, info: TaskInfo, bid: float, t: int, confirm_window: int = 0) -> Reservation:
         tab = self.tables[uid]
         tab.learn_task(info, t)
         if not self.cc.enabled:
             return tab.commit_local(info.id, bid, t, next(self._ids))
-        r = tab.request(info.id, bid, t, next(self._ids))
+        r = tab.request(info.id, bid, t, next(self._ids), confirm_window=confirm_window)
         self.metrics["requests"] += 1
         self._send_claim(uid, r, info, t)
         return r
 
     def _send_claim(self, uid: int, r: Reservation, info: TaskInfo | None, t: int, to: Sequence[int] | None = None) -> None:
         kind = MsgKind.REQUEST
-        msg = Message(kind, uid, {"res": r, "task": info}, self.mc.claim_bytes + 40, t)
+        proto_intent = self.protocol_intents[uid] if uid < len(self.protocol_intents) else 0
+        r_stamped = replace(r, protocol_intent=int(proto_intent))
+        msg = Message(kind, uid, {"res": r_stamped, "task": info}, self.mc.claim_bytes + 40, t)
         self.comm.broadcast(msg, self._nbrs(uid) if to is None else to, t)
 
     def release(self, uid: int, t: int, completed: bool) -> None:
@@ -86,7 +117,9 @@ class CoordinationLayer:
             tab.drop_stale_neighbors(t, self.mc.neighbor_timeout)
             if not self.cc.enabled:
                 continue
-            recs, evs = tab.tick(t, int(link_since[i]), self._ids)
+            # Dynamic consistency window: ensure confirmation window covers channel RTT under packet delay
+            min_window = 2 * int(self.mc.delay_max) + 1 if hasattr(self.mc, "delay_max") and self.mc.delay_max > 0 else None
+            recs, evs = tab.tick(t, int(link_since[i]), self._ids, min_confirm_window=min_window)
             fresh = {tid for name, tid in evs if name == "confirmed"}
             for r in recs:
                 if r.task_id in fresh and r.status == ResStatus.CONFIRMED:
@@ -105,7 +138,19 @@ class CoordinationLayer:
         for u in uavs:
             if not u.comm_ok(t):
                 continue
+            # Communication send-gate: if suppressed and no critical active claim or state change, save bandwidth
             tab = self.tables[u.id]
+            is_suppressed = bool(self.comm_gates[u.id] == 1) if u.id < len(self.comm_gates) else False
+            if self.cc.heartbeat_urgency_confirmed:
+                has_urgent_claim = tab.own is not None and tab.own.status in (ResStatus.PROVISIONAL, ResStatus.CONFIRMED)
+            else:
+                has_urgent_claim = tab.own is not None and tab.own.status == ResStatus.PROVISIONAL
+
+            if is_suppressed and not has_urgent_claim:
+                self.metrics["suppressed_heartbeats"] += 1
+                continue
+            self.metrics["sent_heartbeats"] += 1
+
             claims = tab.live_claims() if self.cc.enabled else []
             recent = [tab.tasks[k] for k, ts in tab.known_since.items() if k in tab.tasks and t - ts <= 10][:8]
             done = [k for k, ts in tab.done.items() if t - ts <= 40][:32]
@@ -151,17 +196,20 @@ class CoordinationLayer:
     def _claim(self, r: int, res: Reservation, t: int, events: List[Event]) -> None:
         tab = self.tables[r]
         mine_before = tab.own
-        out = tab.receive_claim(res, t)
+        proto_intent = self.protocol_intents[r] if r < len(self.protocol_intents) else 0
+        out = tab.receive_claim(res, t, protocol_intent=proto_intent)
         if out == Outcome.STALE:
             self.metrics["stale_rejected"] += 1
         elif out == Outcome.LOST_OWN:
             self.metrics["conflicts"] += 1
             self.metrics["yields"] += 1
+            self.metrics["discovery_latencies"].append(t - res.timestamp)
             events.append((r, "yield", res.task_id))
             if mine_before is not None:
                 self.metrics["conflict_log"].append((t, res.task_id, r, res.uav_id))
         elif out == Outcome.KEPT and tab.own is not None and tab.own.task_id == res.task_id:
             self.metrics["conflicts"] += 1
+            self.metrics["discovery_latencies"].append(t - res.timestamp)
             # defend: tell the rival we outrank it, right now (don't wait for the next heartbeat)
             self._send_claim(r, tab.own, tab.tasks.get(res.task_id), t, to=[res.uav_id])
             self.metrics["defends"] += 1

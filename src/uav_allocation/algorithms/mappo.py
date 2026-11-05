@@ -69,7 +69,7 @@ class MAPPO:
         t0 = time.perf_counter()
         vals = self._values(buf)
         g_states, returns_t, adv_t, offsets, off = [], [], [], [], 0
-        obs, d_glob_step, acts, old_logp, hid = [], [], [], [], []
+        obs, d_glob_step, acts, protos, wins, comms, old_logp, hid = [], [], [], [], [], [], [], []
         mc_returns: List[float] = []
         for ep, (v, last) in zip(buf.episodes, vals):
             r = np.asarray(ep.rewards, dtype=np.float32)
@@ -84,6 +84,9 @@ class MAPPO:
             obs += ep.obs
             d_glob_step += [off + s for s in ep.d_step]
             acts += ep.actions
+            protos += getattr(ep, "protocols", [0] * len(ep.actions))
+            wins += getattr(ep, "windows", [3] * len(ep.actions))
+            comms += getattr(ep, "comms", [0] * len(ep.actions))
             old_logp += ep.logps
             hid += ep.hiddens
             off += len(ep.rewards)
@@ -94,6 +97,9 @@ class MAPPO:
         S = RolloutBuffer.stack_obs(obs)
         S = {k: torch.from_numpy(v).to(dev) for k, v in S.items()}
         A = torch.as_tensor(np.asarray(acts), device=dev)
+        PROTO = torch.as_tensor(np.asarray(protos), device=dev)
+        WIN = torch.as_tensor(np.asarray(wins), device=dev)
+        COMM = torch.as_tensor(np.asarray(comms), device=dev)
         OLP = torch.as_tensor(np.asarray(old_logp, dtype=np.float32), device=dev)
         H = None
         if self.actor.memory is not None:
@@ -106,16 +112,20 @@ class MAPPO:
             G = collate_global(g_states, None)
         else:
             MC = torch.as_tensor(np.asarray(mc_returns, dtype=np.float32), device=dev)
-        agg = {"pi_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clip_frac": 0.0}
+        agg = {
+            "pi_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clip_frac": 0.0,
+            "ent_alloc": 0.0, "ent_proto": 0.0, "ent_win": 0.0, "ent_comm": 0.0,
+            "kl_alloc": 0.0, "kl_proto": 0.0, "kl_win": 0.0, "kl_comm": 0.0,
+        }
         n_mb = 0
         for _ in range(tc.epochs):
             perm = torch.randperm(n, device=dev)
             for i in range(0, n, tc.minibatch_size):
                 idx = perm[i:i + tc.minibatch_size]
                 b = {k: v[idx] for k, v in S.items()}
-                dist, enc = self.actor.get_action_distribution(b, None if H is None else H[idx])
-                logp = dist.log_prob(A[idx])
-                ent = dist.entropy().mean()
+                logp, ent, enc, ent_dict, logp_dict = self.actor.evaluate_actions(
+                    b, A[idx], PROTO[idx], WIN[idx], COMM[idx], None if H is None else H[idx]
+                )
                 ratio = torch.exp(logp - OLP[idx])
                 if self.critic is not None:
                     adv = ADV[idx]
@@ -127,6 +137,16 @@ class MAPPO:
                 s2 = torch.clamp(ratio, 1 - tc.clip, 1 + tc.clip) * adv
                 pi_loss = -torch.min(s1, s2).mean()
                 loss = pi_loss - tc.ent_coef * ent
+                # Auxiliary self-supervised intent prediction loss across observed neighbors
+                # Exclude self-loop node (j=0) and compute mean coordinate loss over valid neighbors
+                pred_intent = self.actor.predict_neighbor_intent(enc, b)
+                # target_intent is normalized relative displacement between neighbor and ego
+                target_intent = b["uav_x"][:, :, :2] - b["uav_x"][:, :1, :2]
+                uav_mask = b["adj_uu"][:, 0].unsqueeze(-1).clone()  # valid neighbor mask
+                uav_mask[:, 0, :] = 0.0  # exclude self-node from auxiliary neighbor loss
+                n_valid = uav_mask.sum().clamp(min=1.0) * 2.0  # coordinate-mean normalization (2 dimensions)
+                intent_loss = (((pred_intent - target_intent) ** 2) * uav_mask).sum() / n_valid
+                loss = loss + 0.1 * intent_loss
                 v_loss = torch.zeros((), device=dev)
                 if self.critic is None:
                     v_loss = ((self.actor.local_value(enc) - MC[idx]) ** 2).mean()
@@ -138,6 +158,10 @@ class MAPPO:
                     self.actor_opt.step()
                 agg["pi_loss"] += pi_loss.item()
                 agg["entropy"] += ent.item()
+                agg["ent_alloc"] += ent_dict["alloc"].item()
+                agg["ent_proto"] += ent_dict["proto"].item()
+                agg["ent_win"] += ent_dict["win"].item()
+                agg["ent_comm"] += ent_dict["comm"].item()
                 agg["kl"] += (OLP[idx] - logp).mean().item()
                 agg["clip_frac"] += ((ratio - 1).abs() > tc.clip).float().mean().item()
                 agg["v_loss"] += v_loss.item()
@@ -201,6 +225,6 @@ def load_actor(path: str, device: torch.device) -> Tuple[GraphActor, Config, Dim
     cfg = config_from_dict(ck["config"])
     dims = feature_dims(cfg)
     actor = GraphActor(dims, cfg.model).to(device)
-    actor.load_state_dict(ck["actor"])
+    actor.load_state_dict(ck["actor"], strict=False)
     actor.eval()
     return actor, cfg, dims

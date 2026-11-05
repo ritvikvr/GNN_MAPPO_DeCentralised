@@ -21,6 +21,9 @@ class EpisodeData:
     obs: List[LocalObservation] = field(default_factory=list)
     d_step: List[int] = field(default_factory=list)
     actions: List[int] = field(default_factory=list)
+    protocols: List[int] = field(default_factory=list)
+    windows: List[int] = field(default_factory=list)
+    comms: List[int] = field(default_factory=list)
     logps: List[float] = field(default_factory=list)
     hiddens: List[Optional[np.ndarray]] = field(default_factory=list)
     terminated: bool = False
@@ -31,10 +34,14 @@ class EpisodeData:
         self.g_states.append(g_state)
         return len(self.g_states) - 1
 
-    def add_decision(self, step: int, o: LocalObservation, a: int, logp: float, hidden: Optional[np.ndarray]) -> None:
+    def add_decision(self, step: int, o: LocalObservation, a: int, logp: float, hidden: Optional[np.ndarray],
+                     proto: int = 0, window: int = 3, comm: int = 0) -> None:
         self.obs.append(o)
         self.d_step.append(step)
         self.actions.append(a)
+        self.protocols.append(proto)
+        self.windows.append(window)
+        self.comms.append(comm)
         self.logps.append(logp)
         self.hiddens.append(hidden)
 

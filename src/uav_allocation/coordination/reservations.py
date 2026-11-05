@@ -51,6 +51,8 @@ class Reservation:
     expiry: int           # lease expiry step
     msg_id: int
     t_request: int = 0    # step the claim was first requested (latency bookkeeping)
+    confirm_window: int = 0 # adaptive learned confirmation window (0 = fallback to table default)
+    protocol_intent: int = 0 # sender protocol intent (0=AUTO, 1=DEFEND, 2=YIELD, 3=RENEW)
 
 
 class Outcome(IntEnum):
@@ -110,6 +112,8 @@ class LocalReservationTable:
         self._seen: Dict[int, int] = {}
         self._last_renew = 0
         self.known_since: Dict[int, int] = {}
+        self.confirmed_failed_uavs: set[int] = set()
+        self.yield_cooldown: Dict[int, int] = {}  # tid -> step until which task is quarantined
 
     # -------------------------------------------------------------- knowledge
     def epoch(self, tid: int) -> int:
@@ -134,6 +138,10 @@ class LocalReservationTable:
             self.tasks.pop(tid)
             self.done.setdefault(tid, t)
             self.claims.pop(tid, None)
+            self.yield_cooldown.pop(tid, None)
+        # Clear expired yield cooldowns
+        for tid in [k for k, exp in self.yield_cooldown.items() if t >= exp]:
+            self.yield_cooldown.pop(tid, None)
         if len(self._seen) > 4096:
             for k in sorted(self._seen)[:2048]:
                 self._seen.pop(k)
@@ -143,9 +151,9 @@ class LocalReservationTable:
             self.neighbors.pop(k)
 
     # -------------------------------------------------------------- own claims
-    def request(self, tid: int, bid: float, t: int, msg_id: int) -> Reservation:
+    def request(self, tid: int, bid: float, t: int, msg_id: int, confirm_window: int = 0) -> Reservation:
         r = Reservation(tid, self.uav_id, float(bid), self.epoch(tid), ResStatus.PROVISIONAL, t, t + self.lease,
-                        msg_id, t_request=t)
+                        msg_id, t_request=t, confirm_window=int(confirm_window))
         self.claims[tid] = r
         self.own = r
         self._last_renew = t
@@ -180,7 +188,7 @@ class LocalReservationTable:
         return r
 
     # -------------------------------------------------------------- incoming claims
-    def receive_claim(self, res: Reservation, t: int) -> Outcome:
+    def receive_claim(self, res: Reservation, t: int, protocol_intent: int = 0) -> Outcome:
         from .conflict_resolution import winner  # local import: avoid cycle
 
         tid = res.task_id
@@ -226,18 +234,42 @@ class LocalReservationTable:
                 return Outcome.RENEWED
             return Outcome.DUPLICATE
         # ---- genuine conflict between two different UAVs
-        w = winner(ex, res)
+        # Policy Protocol Head: YIELD (intent == 2) yields immediately to prevent thrashing
         own_involved = self.own is not None and self.own.task_id == tid
+        if own_involved and protocol_intent == 2 and int(self.own.status) < int(ResStatus.EXECUTING):
+            self.claims[tid] = res
+            self.own = None
+            return Outcome.LOST_OWN
+
+        # Policy Protocol Head: DEFEND (intent == 1)
+        # GUARDRAIL 1: If the reservation owner is confirmed failed, DEFEND must not protect it.
+        # GUARDRAIL 2: If both agents intend to DEFEND (or rival intent is unknown/DEFEND),
+        # neither can override deterministic tie-breaking. Fallback to winner() to prevent mutual deadlock.
+        rival_defending = (getattr(res, "protocol_intent", 0) == 1)
+        rival_failed = res.uav_id in self.confirmed_failed_uavs
+        own_failed = self.uav_id in self.confirmed_failed_uavs
+
+        if own_involved and own_failed:
+            self.claims[tid] = res
+            self.own = None
+            return Outcome.LOST_OWN
+
+        if own_involved and protocol_intent == 1 and not rival_defending and not rival_failed and int(res.status) < int(ResStatus.EXECUTING):
+            w = self.own
+        else:
+            w = winner(ex, res)
+
         if w is res:
             self.claims[tid] = res
             if own_involved:
                 self.own = None
+                self.yield_cooldown[tid] = t + 8  # Quarantine task for 8 steps to break preemption thrashing
                 return Outcome.LOST_OWN
             return Outcome.REPLACED
         return Outcome.KEPT
 
     # -------------------------------------------------------------- periodic maintenance
-    def tick(self, t: int, link_ok_since: int, msg_ids) -> Tuple[List[Reservation], List[Tuple[str, int]]]:
+    def tick(self, t: int, link_ok_since: int, msg_ids, min_confirm_window: Optional[int] = None) -> Tuple[List[Reservation], List[Tuple[str, int]]]:
         """Confirm / renew own claim, expire remote leases.
 
         Returns (records to broadcast, events[(name, task_id)]).
@@ -245,9 +277,11 @@ class LocalReservationTable:
         out: List[Reservation] = []
         events: List[Tuple[str, int]] = []
         o = self.own
+        target_window = o.confirm_window if (o is not None and o.confirm_window > 0) else self.confirm_window
+        eff_window = max(target_window, min_confirm_window) if min_confirm_window is not None else target_window
         if o is not None:
             if o.status == ResStatus.PROVISIONAL:
-                if t - o.timestamp >= self.confirm_window and link_ok_since <= o.timestamp:
+                if t - o.timestamp >= eff_window and link_ok_since <= o.timestamp:
                     r = replace(o, status=ResStatus.CONFIRMED, timestamp=t, expiry=t + self.lease, msg_id=next(msg_ids))
                     self.own = r
                     self.claims[o.task_id] = r
@@ -262,7 +296,9 @@ class LocalReservationTable:
                 self._last_renew = t
                 out.append(r)
         for tid, c in list(self.claims.items()):
-            if c.uav_id != self.uav_id and t > c.expiry:
+            # Failure-aware reservation expiry: if the owner is confirmed failed, release immediately without waiting for lease
+            owner_failed = (c.uav_id in self.confirmed_failed_uavs)
+            if c.uav_id != self.uav_id and (t > c.expiry or owner_failed):
                 self.claims.pop(tid)           # lease lapsed locally; epoch unchanged (see module docstring)
                 events.append(("lease_expired", tid))
         return out, events
